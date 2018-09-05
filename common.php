@@ -1,8 +1,8 @@
 <?php
-##
-# © 2016 Partners HealthCare System, Inc. All Rights Reserved. 
-##
 
+##
+# Â© 2016 Partners HealthCare System, Inc. All Rights Reserved. 
+##
 /**
 	
 	Supporting functions for enhanced autonotification plugin.
@@ -15,222 +15,399 @@
 	It must be used in conjunction with a data entry trigger to function in real-time.
 	The settings for each project are stored as an encoded variable (an) in the query 
   string of the DET.
-
 **/
 
 error_reporting(E_ALL);
-require_once 'common_static_functions.php';
+require_once 'common_static_functions.php'; // some legacy code here
 
 class AutoNotify {
-	
-  // Bump the version as necessary; considering Dimo's changes to Andy's original as 1.1.0
-	const PLUGIN_VERSION = "1.2.0";
 
-	public $config, $config_encoded;	// This is an array of parameters for the autoNotification object
-	public $triggers;
-  public $notification_emails;
-	
-	// DET Project Parameters
-	public $project_id, $instrument, $record, $redcap_event_name, $event_id, $redcap_data_access_group, $instrument_complete;
+    const PluginName = "AutoNotify 2.0";
+    // Message Parameters
+    public $to, $from, $subject, $message;
 
-  
-	// Create an AutoNotify Object based from a DET call
-	// Requires that the project context be set.  It loads the config from the an parameter in the query string
-	public function loadFromDet() {
-    
-		// Get parameters from REDCap DET Post
-		$this->project_id = voefr('project_id');
-		$this->instrument = voefr('instrument');
-		$this->record = voefr('record');
-		$this->redcap_event_name = voefr('redcap_event_name');
-		if (REDCap::isLongitudinal()) {
-			$events = REDCap::getEventNames(true,false);
-			$this->event_id = array_search($this->redcap_event_name, $events);
-		}
-		$this->redcap_data_access_group = voefr('redcap_data_access_group');
-		$this->instrument_complete = voefr($instrument.'_complete');
-		self::loadEncodedConfig(voefr('an'));
-	}
+    // Other properties
+    public $config, $triggers, $pre_det_url, $post_det_url;
 
-	// Loads the config object from the encoded query string variable AN
-	public function loadEncodedConfig($an) {
-    $migration_from_version_1 = FALSE;
-		$this->config_encoded = $an;
-		$this->config = self::decrypt($this->config_encoded);
-    
-    // Perform upgrade from version 1 if detected
-    if (isset($this->config['to'])){
-      $migration_from_version_1 = TRUE;
-      logIt('Conversion from version 1 detected.');
-      self::convertFromVersion1();
+    // DET Project Parameters
+    public $project_id, $instrument, $record, $redcap_event_name, $event_id, $redcap_data_access_group, $instrument_complete;
+
+    // Instantiate the object with the project_id
+    public function __construct($project_id) {
+        if ($project_id) {
+            $this->project_id = intval($project_id);
+        } else {
+            logIt("Called outside of context of project", "ERROR");
+            exit();
+        }
     }
-    
-    // Get triggers
-		if (isset($this->config['triggers'])) {
-			$this->triggers = json_decode(htmlspecialchars_decode($this->config['triggers'], ENT_QUOTES), true);
-		}
-    
-    // Get notification emails
-    if (isset($this->config['notification_emails'])) {
-      $this->notification_emails = json_decode(htmlspecialchars_decode($this->config['notification_emails'], ENT_QUOTES), true);
-      $_SESSION['autonotify_email_notifications'] = $this->notification_emails;  // Save to session for use by Ajax calls
-		}
-    
-    // If migrating from V1, save new config and inform user.
-    if ($migration_from_version_1){
-      $params['last_saved'] = date('y-m-d h:i:s');
-      $params['modified_by'] = USERID;
-      $encoded = self::encode($params);
-      self::updateDetUrl($encoded);
-      renderTemporaryMessage('A configuration from an older version of the Email Notification was detected.');
+
+    // Adds information from the DET post into the current object
+    public function loadDetPost() {
+        $this->project_id = voefr('project_id');
+        $this->instrument = voefr('instrument');
+        $this->record = voefr('record');
+        $this->redcap_event_name = voefr('redcap_event_name');
+        if (REDCap::isLongitudinal()) {
+            $events = REDCap::getEventNames(true,false);
+            $this->event_id = array_search($this->redcap_event_name, $events);
+        } else {
+            global $Proj;
+            $this->event_id = $Proj->firstEventId;
+        }
+        $this->redcap_data_access_group = voefr('redcap_data_access_group');
+        $this->instrument_complete = voefr($this->instrument.'_complete');        
     }
-	}
-	// Execute the loaded DET.  Returns false if any errors
-	public function execute() {
 
-		// Check for Pre-DET url
-		self::checkPreDet();
+    // Converts old autonotify configs that used the url into new ones that use the log table
+    public function checkForUpgrade() {
+        // To be back-compatible, we need to be able to convert old autonotify calls into the newer format.
 
-		// Loop through each notification
-		foreach ($this->triggers as $i => $trigger) {
-			$logic = $trigger['logic'];
-			$title = $trigger['title'];
-			$enabled = $trigger['enabled'];
-			
-			if (!$enabled) {
-				logIt("The current trigger ($title) is not set as enabled - skipping");
-				continue;
+        global $data_entry_trigger_url;
+        $det_qs = parse_url($data_entry_trigger_url, PHP_URL_QUERY);
+
+        parse_str($det_qs,$params);
+        if (!empty($params['an'])) {
+            // Step 1:  We have identified an old DET-based config
+            logIt("Updating older DET url: $data_entry_trigger_url", "DEBUG");
+            $an = $params['an'];
+            $old_config = self::decrypt_v1($an);
+	    
+	    $old_triggers = json_decode(htmlspecialchars_decode($old_config['triggers'], ENT_QUOTES), true);
+	    $old_notifications = json_decode(htmlspecialchars_decode($old_config['notification_emails'], ENT_QUOTES), true);
+	    $old_pre_script_det_url = $old_config['pre_script_det_url'];
+	    $old_post_script_det_url = $old_config['post_script_det_url'];
+	    $i=0;
+	    $converted_triggers = array();
+	    foreach ($old_triggers  as $id=>$t_details) {
+		$email_details = array();
+		if ( isset ( $t_details['notification_email']) ) {
+		    $email_details['to']	= isset ( $old_notifications[$t_details['notification_email']]['to'] ) ? 
+						    $old_notifications[$t_details['notification_email']]['to'] : '';
+		    $email_details['from']	= isset ( $old_notifications[$t_details['notification_email']]['from'] ) ?
+						    $old_notifications[$t_details['notification_email']]['from'] : '';
+		    $email_details['subject']   = isset ( $old_notifications[$t_details['notification_email']]['subject'] ) ? 
+						    $old_notifications[$t_details['notification_email']]['subject'] : '';
+		    $email_details['message']   = isset ( $old_notifications[$t_details['notification_email']]['message'] ) ?
+						    $old_notifications[$t_details['notification_email']]['message'] : ''; 
+		}
+		
+		$converted_triggers[++$i] = array (
+		    'title'	    => isset($t_details['title']) ? $t_details['title'] : '',
+		    'logic'	    => isset($t_details['logic']) ? $t_details['logic'] : '',
+		    'test_record'   => isset($t_details['test_record']) ? $t_details['test_record'] : null,
+		    'test_event'    => isset($t_details['test_event']) ? $t_details['test_event'] : null,
+		    'enabled'	    => isset($t_details['enabled']) ? $t_details['enabled'] : 1,
+		    'to'	    => $email_details['to'],
+		    'from'	    => $email_details['from'],
+		    'subject'	    => $email_details['subject'],
+		    'body'	    => $email_details['message'],
+		);
+	    }
+
+	    // Step 2:  Save the updated autonotify object
+            $this->triggers = $converted_triggers;
+	    $this->config['pre_script_det_url'] = $old_pre_script_det_url;
+	    $this->config['post_script_det_url'] = $old_post_script_det_url;
+	    
+//	    $this->saveConfig();
+//            $log_data = array(
+//                'action' => 'AutoNotify2 config moved from querystring to log',
+//                'an' => $an,
+//                'config' => $old_config
+//            );
+//            REDCap::logEvent(AutoNotify::PluginName . " Update", "Moved querystring config to log table", json_encode($log_data));
+
+            // Step 3:  Update the DET URL to be plain-jane
+//            self::isDetUrlNotAutoNotify(true);
+        }
+    }
+
+    // Scans the log for the latest autonotify configuration
+    public function loadConfig() {
+//		logIt(__FUNCTION__, "DEBUG");
+
+        // Convert old querystring-based autonotify configurations to the log-based storage method
+        $this->checkForUpgrade();
+
+        // Load from the log
+        $sql = "SELECT l.sql_log, l.ts
+			FROM redcap_log_event l WHERE
+		 		l.project_id = " . intval($this->project_id) . "
+			AND (l.page like '%autonotify%' OR l.page = 'PLUGIN')
+			AND l.event = 'OTHER'
+			AND l.description = '" . AutoNotify::PluginName . " Config'
+			ORDER BY ts DESC LIMIT 1";
+        $q = db_query($sql);
+//		logIt(__FUNCTION__ . ": sql: $sql","DEBUG");
+        if (db_num_rows($q) == 1) {
+            // Found config!
+            $row = db_fetch_assoc($q);
+            $this->config = json_decode($row['sql_log'], true);
+            if (isset($this->config['triggers'])) {
+                $this->triggers = json_decode(htmlspecialchars_decode($this->config['triggers'], ENT_QUOTES), true);
+            }
+            logIt(__FUNCTION__ . ": Found version with ts ". $row['ts'],"INFO");
+            return true;
+        } else {
+            // No previous config was found in the logs
+            logIt(__FUNCTION__ . ": No config saved in logs for this project", "INFO");
+            return false;
+        }
+    }
+
+    // Write the current config to the log
+    public function saveConfig() {
+        $sql_log = json_encode($this->config);
+        REDCap::logEvent(AutoNotify::PluginName . " Config", "Configuration Updated", $sql_log);
+        logIt(__FUNCTION__ . ": Saved configuration", "INFO");
+
+        // Update the DET url if needed
+        self::isDetUrlNotAutoNotify(true);
+    }
+
+    // Execute the loaded DET.  Returns false if any errors
+    public function execute() {
+//		logIt(__FUNCTION__, "DEBUG");
+
+        // Check for Pre-DET url
+        self::checkPreDet();
+
+        // Decode the triggers from the config
+        $triggers = json_decode(htmlspecialchars_decode($this->config['triggers'], ENT_QUOTES), true);
+
+        // Loop through each notification
+        foreach ($triggers as $i => $trigger) {
+            $logic = $trigger['logic'];
+            $title = trim($trigger['title']);
+            $enabled = $trigger['enabled'];
+            $scope = isset($trigger['scope']) ? $trigger['scope'] : 0;  // Get the scope or set to 0 (default)
+
+            if (!$enabled) {
+//				logIt(__FUNCTION__ . ": The current trigger ($title) is not set as enabled - skipping", "DEBUG");
+                continue;
+            }
+
+            if (empty($title)) {
+                logIt("Cannot process alert $i because it has an empty title: " . json_encode($trigger),"ERROR");
+                continue;
+            }
+
+            // Append current event prefix to lonely fields if longitidunal
+            if (REDCap::isLongitudinal() && $this->redcap_event_name) $logic = LogicTester::logicPrependEventName($logic, $this->redcap_event_name);
+
+            if (!empty($logic) && !empty($this->record)) {
+		$ProjObj = new Project($this->project_id);
+		$hasRepeatingFormsEvents = $ProjObj->hasRepeatingFormsEvents();
+		$isRepeatEvent = ($hasRepeatingFormsEvents && $ProjObj->isRepeatingEvent($this->event_id));
+		$isRepeatForm  = $isRepeatEvent ? false : ($hasRepeatingFormsEvents && $ProjObj->isRepeatingForm($this->event_id, $this->instrument));
+		$isRepeatEventOrForm = ($isRepeatEvent || $isRepeatForm);
+		
+		if (REDCap::isLongitudinal() && $this->redcap_event_name) {
+		    $logic = LogicTester::logicPrependEventName($logic, $this->redcap_event_name);
+		}
+		
+		$rd = Records::getData($this->project_id, 'array', $this->record);
+		$instance_data = array(); // The data for all instances
+		foreach ($rd as $record=>$event_data)
+		{
+		    foreach (array_keys($event_data) as $event_id)
+		    {
+			if ($event_id == 'repeat_instances') {
+			    $eventNormalized = $event_data['repeat_instances'];
+			} else {
+			    $eventNormalized = array();
+			    $eventNormalized[$event_id][""][0] = $event_data[$event_id];
 			}
-			
-			// Append current event prefix to lonely fields if longitidunal
-			if (REDCap::isLongitudinal() && $this->redcap_event_name) $logic = LogicTester::logicPrependEventName($logic, $this->redcap_event_name);
-			
-			if (!empty($logic) && !empty($this->record)) {
-				if (LogicTester::evaluateLogicSingleRecord($logic, $this->record)) {
-          
-					// Condition is true, check to see if already notified
-					if (!self::checkForPriorNotification($title)) {
-						logIt("Record {$this->record}: Logic test succeeded for trigger ($title)");
-            self::notify($trigger, $this->notification_emails);
-					} else {
-						// Already notified
-						logIt("Record {$this->record}: Event already triggered ($title)");
-					}
-				} else {
-					// Logic did not pass
-					logIt("Record {$this->record}: Logic test failed for trigger ($title)");
+			foreach ($eventNormalized as $event_id=>$data1)
+			{
+			    foreach ($data1 as $repeat_instrument=>$data2)
+			    {
+				foreach (array_keys($data2) as $instance)
+				{
+				    $instance_d = Records::moveRepeatingDataToBaseInstance($event_data, $event_id, $repeat_instrument, $instance);
+				    $instance_data[$instance] = $instance_d;
+				    unset($instance_d);
 				}
-			} else {
-				// object missing logic or record
-				logIt("Record {$this->record}: Unable to execute: missing logic or record for trigger ($title)");
+			    }
 			}
-		}	
+		    }
+		}
 		
-		// Check for Post-DET url
-		self::checkPostDet();
+		$logic_result = false; // default logic is FALSE
+		if ( $isRepeatEvent ) {
+		    $logic_result = LogicTester::apply($logic, $instance_data[1]);
+		}
+		else {
+		    $logic_result = LogicTester::evaluateLogicSingleRecord($logic, $this->record, $rd, null, 1, ($isRepeatEventOrForm ? $this->instrument : null));
+		}
 		
-	}
+		//LogicTester::evaluateLogicSingleRecord($logic, $this->record, $record_data, null, 1, 'my_first_instrument'		
+                //if (LogicTester::evaluateLogicSingleRecord($logic, $this->record, $rd, null, 1, ($isRepeatEventOrForm ? $this->instrument : null))) {
+		if ( $logic_result ) {
+                    // Condition is true, check to see if already notified
+                    if (!self::checkForPriorNotification($title, $scope)) {
+                        $result = self::notify($title, $trigger);
+                        logIt("{$this->record}: Notified ($title) / " . ($result ? 'Success' : 'Failure') );
+                    } else {
+                        // Already notified
+                        logIt("{$this->record}: [$title] - Already notified");
+                    }
+                } else {
+                    // Logic did not pass
+                    //logIt("Logic: $logic / Record: " . $this->record . " / Project: " . $this->project_id, "DEBUG");
+                    logIt("{$this->record}: [$title] - Logic false");
+                }
+            } else {
+                // object missing logic or record
+                logIt("{$this->record}: [$title] - Unable to execute: missing logic or record");
+            }
+        }
 
-  // Convert the configuration from the original autonotify
-  public function convertFromVersion1(){
-    
-    // Create the new notification format and default label
-    $notification_email = array(
-      'label'   => 'Notification email 1',
-      'to'      => $this->config['to'],
-      'from'      => $this->config['from'],
-      'subject'      => $this->config['subject'],
-      'message'      => $this->config['message']
-    );
-    
-    $this->config['notification_emails'] = json_encode(array(
-      "1"   => $notification_email
-    ));
-    
-    // Add the Notification Email to all triggers
-    $old_triggers = json_decode(htmlspecialchars_decode($this->config['triggers'], ENT_QUOTES), true);
-    unset($this->config['triggers']);
-    
-    $index = 1;
-    $new_triggers = array();
-    foreach ($old_triggers as $new_trigger) {
-      $new_trigger['notification_email'] = '1';
-      $new_triggers[$index++] = $new_trigger;
+        // Check for Post-DET url
+        self::checkPostDet();
     }
-    $this->config['triggers'] = json_encode($new_triggers);
-    
-    logIt('Converted v1 notification email: ' . print_r($this->config['notification_emails'], true));
-    logIt('Converted v1 triggers: ' . print_r($this->config['triggers'], true));
-    
-    // Remove old parameters
-    unset($this->config['to']);
-    unset($this->config['from']);
-    unset($this->config['subject']);
-    unset($this->config['message']);
-  }
-  
-  
-	// Used to test the logic and return an appropriate image
-	/**
-	 * 
-	 * @param type $logic
-	 * @return string
-	 */
-	public function testLogic($logic) {
-		
-		logIt('testLogic: '. $logic);
-		
-		if (LogicTester::isValid($logic)) {
-			
-			// Append current event details
-			if (REDCap::isLongitudinal() && $this->redcap_event_name) {
-				$logic = LogicTester::logicPrependEventName($logic, $this->redcap_event_name);
-			}	
-			
-			if (LogicTester::evaluateLogicSingleRecord($logic, $this->record)) {
-				$result = RCView::img(array('class'=>'imgfix', 'src'=>'accept.png'))." True";
-			} else {
-				$result = RCView::img(array('class'=>'imgfix', 'src'=>'cross.png'))." False";
+
+
+    // Used to test the logic and return an appropriate image
+    public function testLogic($logic) {
+	global $Proj;
+
+	// logIt('Testing record '. $this->record . ' with ' . $logic, "DEBUG");
+        if (LogicTester::isValid($logic)) {
+
+            // Append current event details
+            if (REDCap::isLongitudinal() && $this->redcap_event_name) {
+                $logic = LogicTester::logicPrependEventName($logic, $this->redcap_event_name);
+                logIt(__FUNCTION__ . ": logic updated with selected event as " . $logic, "INFO");
+            }
+	    
+	    // Get some of the record data
+	    $record_data = Records::getData($Proj->project_id, 'array', $this->record);
+	    
+	    // This is taken directly from the DataQuality class
+	    // Loop through the data and see if this evaluates to TRUE for at least one instance and keep track of that
+	    $logic_results = array();
+	    foreach ($record_data as $record=>$event_data)
+	    {
+		foreach (array_keys($event_data) as $event_id)
+		{
+		    if ($event_id == 'repeat_instances') {
+			$eventNormalized = $event_data['repeat_instances'];
+		    } else {
+			$eventNormalized = array();
+			$eventNormalized[$event_id][""][0] = $event_data[$event_id];
+		    }
+		    foreach ($eventNormalized as $event_id=>$data1)
+		    {
+			foreach ($data1 as $repeat_instrument=>$data2)
+			{
+			    foreach (array_keys($data2) as $instance)
+			    {
+				$instance_data = Records::moveRepeatingDataToBaseInstance($event_data, $event_id, $repeat_instrument, $instance);
+				$logicresult = LogicTester::apply($logic, $instance_data);
+				$logic_results[$instance] = $logicresult;
+				unset($logicresult);
+				unset($instance_data);
+			    }
 			}
-		} else {
-			$result = RCView::img(array('class'=>'imgfix', 'src'=>'error.png'))." Invalid Syntax";
+		    }
 		}
-		return $result;
-	}
+	    }
 
-	// Check if there is a pre-trigger DET configured - if so, post to it.
-	public function checkPreDet() {
-		if ($this->config['pre_script_det_url']) {
-			http_post($this->config['pre_script_det_url'], $_POST, 10);
-		}
-	}
-	
-	// Check if there is a post-trigger DET configured - if so, post to it.
-	public function checkPostDet() {
-		if ($this->config['post_script_det_url']) {
-			http_post($this->config['post_script_det_url'], $_POST, 10);
-		}
-	}
+	    //if (LogicTester::evaluateLogicSingleRecord($logic, $this->record, $record_data)) { //, null, 1, 'my_first_instrument')) {
+	    if(in_array(true, $logic_results)) {
+                $result = RCView::img(array('class'=>'imgfix', 'src'=>'accept.png'))." True (#".array_search(true,$logic_results).")";
+            } else {
+                $result = RCView::img(array('class'=>'imgfix', 'src'=>'cross.png'))." False";
+            }
+        } else {
+            $result = RCView::img(array('class'=>'imgfix', 'src'=>'error.png'))." Invalid Syntax";
+        }
+        return $result;
+    }
 
-	// Notify and log
-	public function notify($trigger, $notification_emails) {
+    // Check if there is a pre-trigger DET configured - if so, post to it.
+    public function checkPreDet() {
+        if ($this->config['pre_script_det_url']) {
+            self::callDets($this->config['pre_script_det_url']);
+        }
+    }
 
-		global $redcap_version;
-		$dark = "#800000";	//#1a74ba  1a74ba
-		$light = "#FFE1E1";		//#ebf6f3
-		$border = "#800000";	//FF0000";	//#a6d1ed	#3182b9
-    
-    // Get notification email for trigger
-    $notification_email = $notification_emails[$trigger['notification_email']];
-    
-		// Run notification
-		$url = APP_PATH_WEBROOT_FULL . "redcap_v{$redcap_version}/" . "DataEntry/index.php?pid={$this->project_id}&page={$this->instrument}&id={$this->record}&event_id={$this->event_id}";
-		// Message (email html painfully copied from box.net notification email)
-		$msg = RCView::table(array('cellpadding'=>'0', 'cellspacing'=>'0','border'=>'0','style'=>'border:1px solid #bbb; font:normal 12px Arial;color:#666'),
-			RCView::tr(array(),
-				RCView::td(array('style'=>'padding:13px'),
-					RCView::table(array('style'=>'font:normal 15px Arial'),
-						RCView::tr(array(),
+    // Check if there is a post-trigger DET configured - if so, post to it.
+    public function checkPostDet() {
+        if ($this->config['post_script_det_url']) {
+            self::callDets($this->config['post_script_det_url']);
+        }
+    }
+
+    // Takes a pipe-separated list of urls and calls them as DETs
+    private function callDets($urls) {
+        $dets = explode('|',$urls);
+        foreach ($dets as $det_url) {
+            $det_url = trim($det_url);
+            //http_post($det_url, $_POST, 10);
+	    http_post($det_url, $_REQUEST, 10);
+        }
+    }
+
+    // Now that we're not storing the DET in the query string - this simply needs to be the url to this plugin
+    public function getDetUrl() {
+        // Build the url of the page that called us
+        $isHttps = isset($_SERVER['HTTPS']) AND !empty($_SERVER['HTTPS']) AND $_SERVER['HTTPS'] != 'off';
+
+        // Force http for certain domains
+        global $http_only;
+        foreach ($http_only as $site) {
+            if (strpos($_SERVER['HTTP_HOST'], $site) !== false) $isHttps = false;
+        }
+
+        // Build URL
+        $url = 'http' . ($isHttps ? 's' : '') . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+
+        // Remove query string from DET url
+        $url = preg_replace('/\?.*/', '', $url);
+
+        return $url;
+    }
+
+    // If there is a different DET url configured in the project, it will return it, otherwise returns false
+    public function isDetUrlNotAutoNotify($update = false) {
+        global $data_entry_trigger_url;
+        $det_url = self::getDetUrl();
+        if ($data_entry_trigger_url !== $det_url) {
+            logIt("DETS ARE DIFFERENT - DET: [$data_entry_trigger_url] / SELF DET: [$det_url]", "DEBUG");
+            if ($update) {
+                // Force the update
+                $sql = "update redcap_projects set data_entry_trigger_url = '".prep($det_url)."' where project_id = " . intval($this->project_id) . " LIMIT 1;";
+                db_query($sql);
+                REDCap::logEvent(AutoNotify::PluginName . " Update", "Converted DET Url to $det_url (see log table for old value)", $data_entry_trigger_url);
+                $data_entry_trigger_url = $det_url;
+            }
+            return $det_url;
+        } else {
+            return false;
+        }
+    }
+
+    // Notify and log
+    public function notify($title, $trigger) {
+        global $redcap_version;
+        $dark = "#800000";	//#1a74ba  1a74ba
+        $light = "#FFE1E1";		//#ebf6f3
+        $border = "#800000";	//FF0000";	//#a6d1ed	#3182b9
+        // Run notification
+        $url = APP_PATH_WEBROOT_FULL . "redcap_v{$redcap_version}/" . "DataEntry/index.php?pid={$this->project_id}&page={$this->instrument}&id={$this->record}&event_id={$this->event_id}";
+
+      $trigger['include_record'] = ( isset($trigger['include_record']) && !is_null($trigger['include_record']) ) ? $trigger['include_record'] : 1; // default is to have it be ON
+
+	// add the View Record link
+	$view_record_message = RCView::br().RCView::br().RCView::table(array('cellpadding'=>'0', 'cellspacing'=>'0','border'=>'0','style'=>'border:1px solid #bbb; font:normal 12px Arial;color:#666'),
+		RCView::tr(array(),
+			    RCView::td(array('style'=>"border:1px solid $border;background-color:$light;padding:20px"),
+				    RCView::table(array('style'=>'font:normal 12px Arial', 'cellpadding'=>'0','cellspacing'=>'0'),
+
+                      RCView::tr(array(),
 							RCView::td(array('style'=>'font-size:18px;color:#000;border-bottom:1px solid #bbb'),
 								RCView::span(array('style'=>'color:black'),
 									RCVieW::a(array('style'=>'color:black'),
@@ -250,7 +427,7 @@ class AutoNotify {
 										RCView::td(array('style'=>'padding-left:10px;color:#000'),
 											RCView::span(array('style'=>'color:black'),
 												RCView::a(array('style'=>'color:black'),
-													"<b>".$trigger['title']."</b>"
+													"<b>".trim($trigger['title'])."</b>"
 												)
 											)
 										)
@@ -314,424 +491,560 @@ class AutoNotify {
 												)
 											)
 										)
-									).
-									RCView::tr(array(),
-										RCView::td(array('style'=>'text-align:right'),
-											"Message: "
-										).
-										RCView::td(array('style'=>'padding-left:10px;color:#000'),
-											RCView::span(array('style'=>'color:black'),
-												RCView::a(array('style'=>'color:black'),
-													$notification_email['message']
-												)
-											)
-										)
-									)
+									)								
 								)
 							)
 						).
-						RCView::tr(array(),
-							RCView::td(array('style'=>"border:1px solid $border;background-color:$light;padding:20px"),
-								RCView::table(array('style'=>'font:normal 12px Arial', 'cellpadding'=>'0','cellspacing'=>'0'),
-									RCView::tr(array('style'=>'vertical-align:middle'),
-										RCView::td(array(),
-											RCView::table(array('cellpadding'=>'0','cellspacing'=>'0'),
-												RCView::tr(array(),
-													RCView::td(array('style'=>"border:1px solid #600000;background-color:$dark;padding:8px;font:bold 12px Arial"),
-														RCView::a(array('class'=>'hide','style'=>'color:#fff;white-space:nowrap;text-decoration:none','href'=>$url),
-															"View Record"
-														)
-													)
-												)
-											)
-										).
-										RCView::td(array('style'=>'padding-left:15px'),
-											"To view this record, visit this link:".
-											RCView::br().
-											RCView::a(array('style'=>"color:$dark",'href'=>$url),
-												$url
-											)
-										)
-									)
-								)
-							)
-						)
-					)
-				)
-			)
-		);
-		$msg = "<HTML><head></head><body>".$msg."</body></html>";
-		
-		// Prepare message
-		$email = new Message();
-		$email->setTo($notification_email['to']);
-		$email->setFrom($notification_email['from']);
-		$email->setSubject($notification_email['subject']);
-		$email->setBody($msg);
 
-		// Send Email
-		if (!$email->send()) {
-			error_log('Error sending mail: '.$email->getSendError().' with '.json_encode($email));
-      $data_values = "title,".$trigger['title']."\nrecord,{$this->record}\nevent,{$this->redcap_event_name}";
-      REDCap::logEvent('Failed sending autoNotify notification email',$data_values);
-			exit;
-		}
-		
-		// Add Log Entry
-		$data_values = "title,".$trigger['title']."\nrecord,{$this->record}\nevent,{$this->redcap_event_name}";
-    logIt("Notification email ({$notification_email['label']}) sent for trigger ({$trigger['title']}), record ({$this->record}), event ({$this->redcap_event_name})");
-		REDCap::logEvent('AutoNotify Alert',$data_values);
-	}
-	
-	// Go through logs to see if there is a prior alert for this record/event/title
-	public function checkForPriorNotification($title) {
-		$sql = "SELECT l.data_values, l.ts 
+
+                        RCView::tr(array('style'=>'vertical-align:middle'),
+                            RCView::td(array(),
+                                RCView::table(array('cellpadding'=>'0','cellspacing'=>'0'),
+                                    RCView::tr(array(),
+                                        RCView::td(array('style'=>"border:1px solid #600000;background-color:$dark;padding:8px;font:bold 12px Arial"),
+                                            RCView::a(array('class'=>'hide','style'=>'color:#fff;white-space:nowrap;text-decoration:none','href'=>$url),
+                                                "View Record"
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                            /**RCView::td(array('style'=>'padding-left:15px'),
+                                "You can view the record in the Data Entry Screen or by follwing the URL below: ".
+                                RCView::br().
+                                RCView::a(array('style'=>"color:$dark",'href'=>$url),
+                                    $url
+                                )
+                            )*/
+                        ).
+                        RCView::tr(array('style'=>'vertical-align:middle'),
+                            RCView::td(array('style'=>'padding-left:15px'),
+                                RCView::br().
+                                "You can view the record in the Data Entry Screen or by follwing the URL below: ".
+                                RCView::br().
+                                RCView::a(array('style'=>"color:$dark",'href'=>$url),
+                                    $url
+                                )
+                            )
+                        ).
+                        RCView::tr(array('style'=>'vertical-align:middle'),
+                            RCView::td(array('style'=>'padding-left:15px; font-size: 10px;'),
+                                RCView::br().
+                                RCView::br().
+                                "Email sent from ".
+                                //RCView::br().
+                                RCView::a(array('style'=>"color:$dark",'href'=>APP_PATH_WEBROOT_FULL),
+                                    APP_PATH_WEBROOT_FULL
+                                )
+                            )
+                        )
+
+				    )
+			    )
+		    )
+		);
+	$trigger['body'] = nl2br(trim($trigger['body']));
+    if ( $trigger['include_record'] == 1 )
+	    $trigger['body'].=RCView::br().$view_record_message;
+
+    // Determine number of emails to send
+
+    // Prepare message
+    $email = new Message();
+    $email->setTo(self::pipeThis($trigger['to']));
+    $email->setBcc(self::pipeThis($trigger['bcc']));
+    $email->setFrom(self::pipeThis($trigger['from']));
+    $email->setSubject(strip_tags(self::pipeThis($trigger['subject'])));
+    $email->setBody("<html><head></head><body>".self::pipeThis($trigger['body'])."</body></html>");
+
+    // Send Email
+    if (!$email->send()) {
+        error_log('Error sending mail: '.$email->getSendError().' with '.json_encode($email));
+        REDCap::logEvent(
+            AutoNotify::PluginName . " Error", "Error sending AutoNotify2 Email: " . $title,
+            $email->getSendError() . " with " . json_encode($email),
+            $this->record,
+            $this->event_id
+        );
+        return false;
+    }
+
+        // Add Log Entry
+        $data_values = "==> AutoNotify2 Rule Fired\n".
+            "title,$title\n".
+            "record,{$this->record}\n" .
+            (REDcap::isLongitudinal() ? "event,{$this->redcap_event_name}" : "");
+        REDCap::logEvent('AutoNotify2 Alert',$data_values,"",$this->record, $this->event_id);
+        return true;
+    }
+
+    // A wrapper for piping values...
+    public function pipeThis($input, $instance = 1) {
+        $result = Piping::replaceVariablesInLabel($input, $this->record, $this->event_id, $instance, null, false, $this->project_id, false);
+        return $result;
+    }
+
+    // Go through logs to see if there is a prior alert for this record/event/title
+    // Scope 0 is record/event match, scope 1 is record only
+    public function checkForPriorNotification($title, $scope=0) {
+        if (!REDCap::isLongitudinal()) $scope = 1; // Record match only is sufficient
+        $sql = "SELECT l.data_values, l.ts
 			FROM redcap_log_event l WHERE 
 		 		l.project_id = {$this->project_id}
-			AND l.page = 'PLUGIN' 
-			AND l.description = 'AutoNotify Alert';";
-		$q = db_query($sql);
-		while ($row = db_fetch_assoc($q)) {
-			$pairs = parseEnum($row['data_values']);
-			if ($pairs['title'] == $title &&
-				$pairs['record'] == $this->record &&
-				$pairs['event'] == $this->redcap_event_name)
-			{
-				$date = substr($row['ts'], 4, 2) . "/" . substr($row['ts'], 6, 2) . "/" . substr($row['ts'], 0, 4);
-				$time = substr($row['ts'], 8, 2) . ":" . substr($row['ts'], 10, 2);
+			AND (l.page like '%autonotify%' OR l.page = 'PLUGIN')
+			AND l.event = 'OTHER'
+			AND l.description = 'AutoNotify2 Alert';";
+        $q = db_query($sql);
 
-				// Already triggered
-				return true;
-			}
-		}
-		return false;
-	}
-	
-	// Takes an encoded string and returns the array representation of the object
-	public function decrypt($code) {
-		$template_enc = rawurldecode($code);
-		$json = decrypt_static($template_enc);	//json string representation of parameters
-		$params = json_decode($json, true);	//array representation
-		if ( is_null ($params) ) {
-      // try decrypting with the 6.x.x version function
-      $json = decrypt ( $template_enc );
-      $params = json_decode($json,true);
+        while ($row = db_fetch_assoc($q)) {
+            $pairs = parseEnum($row['data_values']);
+            if (
+                $pairs['title'] == trim($title) &&
+                $pairs['record'] == $this->record &&
+                ( $scope == 1 OR $pairs['event'] == $this->redcap_event_name)
+            )
+            {
+                $date = substr($row['ts'], 4, 2) . "/" . substr($row['ts'], 6, 2) . "/" . substr($row['ts'], 0, 4);
+                $time = substr($row['ts'], 8, 2) . ":" . substr($row['ts'], 10, 2);
+
+                // Already triggered
+                logIt("Trigger previously matched on $date $time / Row: ". json_encode($row) . " / Pairs: " . json_encode($pairs), "DEBUG");
+                return true;
+            }
+        }
+        return false;
     }
-		return $params;
-	}
 
-	// Takes an array and returns the encoded string
-	public function encode($params) {
-		$json = json_encode($params);  
-		$encoded = encrypt_static($json);
-		return rawurlencode($encoded);
-	}
-
-  // Renders the notification emails portion of the page, or an empty notification email if new
-	public function renderNotifications() {
-		$html = "<div id='notifications_config'>";
-
-		if (isset($this->notification_emails)) {
-			foreach ($this->notification_emails as $i => $notification_email) {
-				$html .= self::renderNotificationEmail($i, $notification_email['label'], $notification_email['to'], $notification_email['from'], $notification_email['subject'], $notification_email['message']);
-			}
-		} else {
-			$html .= self::renderNotificationEmail(1);
-		}
-		$html .= "</div>";
-		return $html;
-	}
-  
-  // Render an individual notification email (also called by Ajax to add a new notification email to the page)
-	public function renderNotificationEmail($id, $label = '', $to = '', $from = '', $subject = '', $message = '') {
-		$html = RCView::div(array('class'=>'round chklist notification_email','idx'=>"$id"),
-			RCView::div(array('class'=>'chklisthdr', 'style'=>'color:rgb(128,0,0); margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #AAA;'), "Notification Email $id: $label".
-				RCView::a(array('href'=>'javascript:','onclick'=>"removeNotificationEmail('$id')"), RCView::img(array('style'=>'float:right;padding-top:0px;', 'src'=>'cross.png')))
-			).
-			RCView::table(array('cellspacing'=>'5', 'class'=>'tbi'),
-				self::renderRow('label-'.$id,'Label',$label,'label').
-				self::renderEmailRow('to-'.$id,'To',$to,'to').
-        self::renderEmailRow('from-'.$id,'From',$from,'from').
-				self::renderRow('subject-'.$id,'Subject',(empty($subject) ? 'SEND SECURE:' : $subject),'subject').
-        self::renderRow('message-'.$id,'Message',$message,'message')
-			)
-		);
-		return $html;
-	}
-  
-	// Renders the triggers portion of the page, or an empty trigger if new
-	public function renderTriggers() {
-		$html = "<div id='triggers_config'>";
-		if (isset($this->triggers)) {
-			foreach ($this->triggers as $i => $trigger) {
-				$html .= self::renderTrigger($i, $trigger['title'], $trigger['logic'], $trigger['notification_email'], $trigger['test_record'], $trigger['test_event'], $trigger['enabled']);
-			}
-		} else {
-			$html .= self::renderTrigger(1);
-		}
-		$html .= "</div>";
-		return $html;
-	}
-	
-	// Render an individual trigger (also called by Ajax to add a new trigger to the page)
-	public function renderTrigger($id, $title = '', $logic = '', $notification_email = '', $test_record = null, $test_event = null, $enabled = 1) {
-		$html = RCView::div(array('class'=>'round chklist trigger','idx'=>"$id"),
-			RCView::div(array('class'=>'chklisthdr', 'style'=>'color:rgb(128,0,0); margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #AAA;'), "Trigger $id: $title".
-				RCView::a(array('href'=>'javascript:','onclick'=>"removeTrigger('$id')"), RCView::img(array('style'=>'float:right;padding-top:0px;', 'src'=>'cross.png')))
-			).
-			RCView::table(array('cellspacing'=>'5', 'class'=>'tbi'),
-				self::renderRow('title-'.$id,'Title',$title, 'title').
-				self::renderLogicRow($id,'Conditional Logic',$logic, 'logic').
-        self::renderNotificationEmailRow($id,'Notification email',$notification_email, 'notification_email').
-				self::renderTestRow($id,'Test Logic', $test_record, $test_event, 'test').
-				self::renderEnabledRow($id,'<nobr>Trigger Status</nobr>', $enabled)
-				//	self::renderStatusRow();	// Enable or Disable the current trigger
-			)
-		);
-		return $html;
-	}
-	
-	// Adds a single row with an input
-	public function renderRow($id, $label, $value, $help_id = null) {
-		$help_id = ( $help_id ? $help_id : $id);
-		$row = RCView::tr(array(),
-			RCView::td(array('class'=>'td1'), self::insertHelp($help_id)).
-			RCView::td(array('class'=>'td2'), "<label for='$id'><b>$label:</b></label>").
-			RCView::td(array('class'=>'td3'),
-		 		RCView::input(array('class'=>'tbi x-form-text x-form-field','id'=>$id,'name'=>$name,'value'=>$value))
-			)
-		);
-		return $row;
-	}
-  
-  // Adds a single row with an input
-	public function renderEmailRow($id, $label, $value, $help_id = null) {
-		$help_id = ( $help_id ? $help_id : $id);
-		$row = RCView::tr(array(),
-			RCView::td(array('class'=>'td1'), self::insertHelp($help_id)).
-			RCView::td(array('class'=>'td2'), "<label for='$id'><b>$label:</b></label>").
-			RCView::td(array('class'=>'td3'),
-		 		RCView::input(array('class'=>'tbi x-form-text x-form-field','id'=>$id,'name'=>$name,'value'=>$value))
-			)
-		);
-		return $row;
-	}
-
-	// Renders the logic row with the text area
-	public function renderLogicRow($id, $label, $value) {
-		$row = RCView::tr(array(),
-			RCView::td(array('class'=>'td1'), self::insertHelp('logic')).
-			RCView::td(array('class'=>'td2'), "<label for='logic-$id'><b>$label:</b></label>").
-			RCView::td(array('class'=>'td3'),
-			 	RCView::textarea(array('class'=>'tbi x-form-text x-form-field','id'=>"logic-$id",'name'=>"logic-$id",'onblur'=>"testLogic('$id');"), $value).
-				RCView::div(array('style'=>'text-align:right'),
-					RCView::a(array('onclick'=>'growTextarea("logic-'.$id.'")', 'style'=>'font-weight:normal;text-decoration:none;color:#999;font-family:tahoma;font-size:10px;', 'href'=>'javascript:;'),'Expand')
-				)
-			)
-		);
-		return $row;
-	}
-	
-	// Renders the enabled row
-	public function renderEnabledRow($id, $label, $value) {
-		//error_log('ID:'.$id.' and VALUE:'.$value);
-		$enabledChecked = ($value == 1 ? 'checked' : '');
-		$disabledChecked = ($value == 1 ? '' : 'checked');
-		$row = RCView::tr(array(),
-			RCView::td(array('class'=>'td1'), self::insertHelp('enabled')).
-			RCView::td(array('class'=>'td2'), "<label for='logic-$id'><b>$label:</b></label>").
-			RCView::td(array('class'=>'td3'),
-				RCView::span(array(),
-					RCView::radio(array('name'=>"enabled-$id",'value'=>'1',$enabledChecked=>$enabledChecked)). 
-					'Enabled' . RCView::SP . RCView::SP .
-					RCView::radio(array('name'=>"enabled-$id",'value'=>'0',$disabledChecked=>$disabledChecked)). 
-					'Disabled'
-				)
-			)
-		);
-		return $row;
-	}
-	
-	// Renders a notification email row with dropdown for the various notification emails
-	public function renderNotificationEmailRow($id, $label, $selectedNotificationEmail) {
-
-		// Make a dropdown that contains all notification email labels
-    $aen = $_SESSION['autonotify_email_notifications'];
-    $notification_email_options = array();
-    if (isset($this) && isset($this->notification_emails)) {
-			foreach ($this->notification_emails as $i => $notification_email) $notification_email_options[$i] = $notification_email['label'];
-    } elseif (isset($aen)) {  // Called via AJAX
-      foreach ($aen as $i => $notification_email) $notification_email_options[$i] = $notification_email['label'];
+    // Takes an encoded string and returns the array representation of the object
+    public function decrypt($code) {
+        $template_enc = rawurldecode($code);
+        $json = decrypt_me($template_enc);	//json string representation of parameters
+        $params = json_decode($json, true);	//array representation
+        return $params;
     }
-    
-    $row = RCView::tr(array(),
-      RCView::td(array('class'=>'td1'), self::insertHelp('notification_email')).
-      RCView::td(array('class'=>'td2'), "<label for='notification-email-$id'><b>$label:</b></label>").
-      RCView::td(array('class'=>'td3'),
-        RCView::select(array('id'=>"notification_email-$id", 'name'=>"notification_email-$id", 'class'=>"tbi x-form-text x-form-field", 'style'=>'height:20px;border:0px;'), $notification_email_options, $selectedNotificationEmail)
-      )
-    );
-
-    return $row;	
-    
-  }
-  
-	// Renders a test row with dropdowns for the various events/records in the project
-	public function renderTestRow($id, $label, $selectedRecord, $selectedEvent) {
-		// Make a dropdown that contains all record_ids.
-		$data = REDCap::getData('array', NULL, REDCap::getRecordIdField());
-
-		foreach ($data as $record_id => $arr) $record_id_options[$record_id] = $record_id;
-
-		// Get all Events
-		$events = REDCap::getEventNames(TRUE,FALSE);
-		$row = RCView::tr(array(),
-			RCView::td(array('class'=>'td1'), self::insertHelp('test')).
-			RCView::td(array('class'=>'td2'), "<label for='test-$id'><b>$label:</b></label>").
-			RCView::td(array('class'=>'td3'),
-				RCView::span(array(), "Test logic using ".REDCap::getRecordIdField().":".
-					RCView::select(array('id'=>"test_record-$id", 'name'=>"test_record-$id", 'class'=>"tbi x-form-text x-form-field", 'style'=>'height:20px;border:0px;', 'onchange'=>"testLogic('$id');"), $record_id_options, $selectedRecord)
-				).
-				RCView::span(array('style'=>'display:'. (REDCap::isLongitudinal() ? 'inline;':'none;')), " of event ".
-					RCView::select(array('id'=>"test_event-$id", 'name'=>"test_event-$id", 'class'=>"tbi x-form-text x-form-field", 'style'=>'height:20px;border:0px;', 'onchange'=>"testLogic('$id');"), $events, $selectedEvent)
-				).
-				RCView::span(array(),
-					RCView::button(array('class'=>'jqbuttonmed ui-button ui-widget ui-state-default ui-corner-all ui-button-text-only','onclick'=>'testLogic("'.$id.'");', 'style'=>'margin:0px 10px;'), 'Test').
-					RCView::span(array('id'=>'result-'.$id))
-				)
-			)
-		);
-		return $row;	
+    // The function to decrypt version 1 code
+    public function decrypt_v1($code) {
+	$template_enc = rawurldecode($code);
+	$json = decrypt_static($template_enc);	//json string representation of parameters
+	$params = json_decode($json, true);	//array representation
+	if ( is_null ($params) ) {
+	    // try decrypting with the 6.x.x version function
+	    $json = decrypt ( $template_enc );
+	    $params = json_decode($json,true);
 	}
+	return $params;
+    }
+
+    // Takes an array and returns the encoded string
+    public function encode($params) {
+        $json = json_encode($params);
+        $encoded = encrypt($json);
+        return rawurlencode($encoded);
+    }
+
+    // Renders the triggers portion of the page, or an empty trigger if new
+    public function renderTriggers() {
+        $html = "<div id='triggers_config'>";
+        if (isset($this->triggers)) {
+            foreach ($this->triggers as $i => $trigger) {
+                $html .= self::renderTrigger($i, $trigger); //['title'], $trigger['logic'], $trigger['test_record'], $trigger['test_event'], $trigger['enabled'], $trigger['scope']);
+            }
+        } else {
+            $html .= self::renderTrigger(1);
+        }
+        $html .= "</div>";
+        return $html;
+    }
+
+    // Render an individual trigger (also called by Ajax to add a new trigger to the page)
+    public function renderTrigger($id, $trigger = array() ) {
+        //, $title = '', $logic = '', $test_record = null, $test_event = null, $enabled = 1, $scope=0, $to='', $bcc='', $from='',$subject='',$body='') {
+        $title = isset($trigger['title']) ? trim($trigger['title']) : '';
+        $logic = isset($trigger['logic']) ? trim($trigger['logic']) : '';
+        $test_record = isset($trigger['test_record']) ? $trigger['test_record'] : null;
+        $test_event = isset($trigger['test_event']) ? $trigger['test_event'] : null;
+        $enabled = isset($trigger['enabled']) ? $trigger['enabled'] : 1;
+        $scope = isset($trigger['scope']) ? $trigger['scope'] : 0;
+        $to = isset($trigger['to']) ? trim($trigger['to']) : '';
+        $bcc = isset($trigger['bcc']) ? trim($trigger['bcc']) : '';
+        $from = isset($trigger['from']) ? trim($trigger['from']) : '';
+        $subject = isset($trigger['subject']) ? trim($trigger['subject']) : 'SEND SECURE:';
+        $body = isset($trigger['body']) ? trim($trigger['body']) : '';
+        $include_record = isset($trigger['include_record']) ? trim($trigger['include_record']) : 1;
+
+        $html = RCView::div(array('class'=>'round chklist trigger','idx'=>"$id"),
+            RCView::div(array('class'=>'chklisthdr', 'style'=>'color:rgb(128,0,0); margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #AAA;'), "Trigger $id: $title".
+                RCView::a(array('href'=>'javascript:','onclick'=>"removeTrigger('$id')"), RCView::img(array('style'=>'float:right;padding-top:0px;', 'src'=>'cross.png')))
+            ).
+            RCView::table(array('cellspacing'=>'5', 'class'=>'tbi'),
+                self::renderRow('title-'.$id,'Title',$title, 'title').
+                self::renderLogicRow($id,'Logic',$logic, 'logic').
+                (REDCap::isLongitudinal() ? self::renderScopeRow($id, 'Evaluate', $scope) : "") .
+                self::renderTestRow($id,'Test Logic', $test_record, $test_event, 'test').
+                self::renderEnabledRow($id,'Status', $enabled) .
+            //	self::renderStatusRow();	// Enable or Disable the current trigger
+                self::renderRow('to-'.$id,'To', $to, 'to') .
+                self::renderRow('bcc-'.$id,'Bcc', $bcc, 'bcc') .
+                self::renderRow('from-'.$id,'From', $from, 'from') .
+                self::renderRow('subject-'.$id,'Subject', $subject, 'subject') .
+                self::renderRow('body-'.$id,'Body', $body, 'body', 'textarea').
+                self::renderIncludeRecordRow($id, 'Include Link to Record',$include_record)
+            )
+        );
+        return $html;
+    }
+
+
+    // Adds a single row with an input
+    public function renderRow($id, $label, $value, $help_id = null, $format='input') {
+        global $project_id;
+
+        $help_id = ( $help_id ? $help_id : $id);
+        $input_element = '';
+
+        if ( strpos($help_id, 'det_url') !== false ) {
+            // If the DET is itself - remove it - otherwise we can get in a loop
+            if ( strpos($value, "plugins/autonotify") !== FALSE ) {
+                $value = ''; // don't call yourself in a loop
+            }
+            // Append the PID to the DET
+            if ( isset ($value) && strlen($value) > 0 ) {
+                if ( strpos($value,'?') !== false ) {
+                    if ( strpos($value, "&pid=") == false && strpos($value, "?pid=") == false)
+                        $value .= '&pid='.$project_id;
+                }
+                else {
+                    if ( strpos($value,"?pid=") == false)
+                        $value .= '?pid='.$project_id;
+                }
+            }
+        }
 	
-	public function insertHelp($e) {
-		return "<span><a href='javascript:;' id='".$e."_info_trigger' info='".$e."_info' class='info' title='Click for help'><img class='imgfix' style='height: 16px; width: 16px;' src='".APP_PATH_IMAGES."help.png'></a></span>";
-	}
+        if ($format == 'input') {
+            $input_element = RCView::input(array('class'=>'tbi x-form-text x-form-field','id'=>$id, 'value'=>$value));
+        } elseif ($format == 'textarea') {
+            $input_element = RCView::textarea(array('class'=>'tbi x-form-text x-form-field','id'=>$id), $value) .
+                RCView::div(array('style'=>'text-align:right'),
+                    RCView::a(array('onclick'=>'growTextarea("' . $id. '")', 'style'=>'font-weight:normal;text-decoration:none;color:#999;font-family:tahoma;font-size:10px;', 'href'=>'javascript:;'),'Expand')
+                );
+        } else {
+            $input_element = "Invalid input format!!!";
+        }
 
-	public function updateDetUrl($an) {
+        $row = RCView::tr(array(),
+            RCView::td(array('class'=>'td1'), self::insertHelp($help_id)).
+            RCView::td(array('class'=>'td2'), "<label for='$id'><b>$label:</b></label>").
+            RCView::td(array('class'=>'td3'), $input_element).
+	    (strpos($help_id, 'det_url') !== false ? RCView::td(array('class'=>'td4'), 
+		    RCView::span(array(),
+                    RCView::button(array('class'=>'jqbuttonmed ui-button ui-widget ui-state-default ui-corner-all ui-button-text-only','onclick'=>'goto_det_url("'.$value.'");', 'style'=>'margin:0px 10px;'), 'Open URL').
+                    RCView::span(array('id'=>'det-test-'.$id),'')
+                )
+	    ) : '')
+        );
+        return $row;
+    }
 
-    global $data_entry_trigger_url;
-    $protocol = self::getServerProtocol();
+    // Renders the logic row with the text area
+    public function renderLogicRow($id, $label, $value) {
+        $row = RCView::tr(array(),
+            RCView::td(array('class'=>'td1'), self::insertHelp('logic')).
+            RCView::td(array('class'=>'td2'), "<label for='logic-$id'><b>$label:</b></label>").
+            RCView::td(array('class'=>'td3'),
+                RCView::textarea(array('class'=>'tbi x-form-text x-form-field','id'=>"logic-$id",'name'=>"logic-$id",'onblur'=>"testLogic('$id');"), $value).
+                RCView::div(array('style'=>'text-align:right'),
+                    RCView::a(array('onclick'=>'growTextarea("logic-'.$id.'")', 'style'=>'font-weight:normal;text-decoration:none;color:#999;font-family:tahoma;font-size:10px;', 'href'=>'javascript:;'),'Expand')
+                )
+            )
+        );
+        return $row;
+    }
 
-		// Create a DET URL:
-    $base = $protocol.'://'.$_SERVER['SERVER_NAME'];
-		$parse_url = parse_url($_SERVER['PHP_SELF']);
-		$path = dirname($parse_url['path']);
-		$data_entry_trigger_url = $base . $path . '/?an=' . $an;
-		$sql = "update redcap_projects set data_entry_trigger_url = '".prep($data_entry_trigger_url)."' where project_id = " . PROJECT_ID . " LIMIT 1;";
-		$q = db_query($sql);
-	}
+    // Renders the enabled row
+    public function renderEnabledRow($id, $label, $value) {
+        //error_log('ID:'.$id.' and VALUE:'.$value);
+        $enabledChecked = ($value == 1 ? 'checked' : '');
+        $disabledChecked = ($value == 1 ? '' : 'checked');
+        $row = RCView::tr(array(),
+            RCView::td(array('class'=>'td1'), self::insertHelp('enabled')).
+            RCView::td(array('class'=>'td2'), "<label for='logic-$id'><b>$label:</b></label>").
+            RCView::td(array('class'=>'td3'),
+                RCView::span(array(),
+                    RCView::radio(array('name'=>"enabled-$id",'value'=>'1',$enabledChecked=>$enabledChecked)).
+                    RCView::span(array('class'=>'radio-option'),'Enabled') . RCView::SP . RCView::SP .
+                    RCView::radio(array('name'=>"enabled-$id",'value'=>'0',$disabledChecked=>$disabledChecked)).
+                    RCView::span(array('class'=>'radio-option'),'Disabled')
+                )
+            )
+        );
+        return $row;
+    }
 
-  // Return the server protocol which invoked this script
-  public function getServerProtocol(){
-    $protocol_raw = explode("/",$_SERVER['SERVER_PROTOCOL']);
-    $protocol = strtolower($protocol_raw[0]);
-    if ( ($protocol === 'http' ) || ($protocol) === 'https' ) return $protocol;
-    return 'https';
-  }
-      
-  // Process help dialogs
-  public function renderHelpDivs() {
-		$help = RCView::div(array('id'=>'label_info','style'=>'display:none;'),
-			RCView::p(array(),'You may configure one or more notification emails.  Each trigger is associated with a single notification email, via the notification email label, therefore this label must be unique.'
-			)
-    ).RCView::div(array('id'=>'notification_email_info','style'=>'display:none;'),
-			RCView::p(array(),'Select one of the saved Notification Emails to use when this trigger is activated.'
-			)
-    ).RCView::div(array('id'=>'to_info','style'=>'display:none;'),
-			RCView::p(array(),'The following are valid email formats:'.
-				RCView::ul(array('style'=>'margin-left:15px;'),
-					RCView::li(array(),'user@example.com').
-					RCView::li(array(),'user@example.com, anotheruser@example.com')
-				)
-			)
-		).RCView::div(array('id'=>'from_info','style'=>'display:none;'),
-			RCView::p(array(),'Please note that some spam filters may classify this email as spam. As always, it is best to test prior to going into production.'.
-				RCView::ul(array('style'=>'margin-left:15px;'),
-					RCView::li(array(),'A valid format is: user@example.com')
-				)
-			)
-		).RCView::div(array('id'=>'subject_info','style'=>'display:none;'),
-			RCView::p(array(),'To send a secure message, prefix the subject with <B>SEND SECURE:</b>'.
-				RCView::ul(array('style'=>'margin-left:15px;'),
-					RCView::li(array(),'SEND SECURE only needs to be included if you are emailing confidential or protected health information to NON-Partners email domains (email addresses external to Partners).')
-				)
-			)
-		).RCView::div(array('id'=>'message_info','style'=>'display:none;'),
-			RCView::p(array(),'This message will be included in the alert.  Piping is not supported.')
-		).
-		RCView::div(array('id'=>'title_info','style'=>'display:none;'),
-			RCView::p(array(),'An alert will only be fired once per record/event/title.  This means that if you rename a trigger it may re-fire next time you save a previously true record.  The title of the alert will also be included in the notification email.')
-		).
-		RCView::div(array('id'=>'logic_info','style'=>'display:none;'),
-			RCView::p(array(),'This is an expression that will be evaluated to determine if the saved record should trigger an alert.  You should use the same format you use for branching logic.')
-		).
-		RCView::div(array('id'=>'test_info','style'=>'display:none;'),
-			RCView::p(array(),'You can test your logical expression by selecting a record (and event) to evaluate the expression against.  This is useful if you have an existing record that would be a match for your condition.')
-		).
-    RCView::div(array('id'=>'enabled_info','style'=>'display:none;'),
-			RCView::p(array(),'Rather than permanently deleting a trigger, you may enaable/disable it as necessary.')
-		).
-    RCView::div(array('id'=>'post_script_det_url_info','style'=>'display:none;'),
-			RCView::p(array(),'By inserting a valid URL into this field you can trigger a second DET <b>AFTER</b> this one is complete.  This is useful for chaining DETs together.')
-		).RCView::div(array('id'=>'pre_script_det_url_info','style'=>'display:none;'),
-			RCView::p(array(),'By inserting a valid DET URL into this field you can trigger a DET to run <b>BEFORE</b> this notification trigger.  This might be useful for running an auto-scoring algorithm, for example.')
-		);
-		echo $help;
-	}
-  
+      public function renderIncludeRecordRow($id, $label, $value) {
+        //error_log('ID:'.$id.' and VALUE:'.$value);
+        $enabledChecked = ($value == 1 ? 'checked' : '');
+        $disabledChecked = ($value == 1 ? '' : 'checked');
+        $row = RCView::tr(array(),
+          RCView::td(array('class'=>'td1'), self::insertHelp('inlcude_record')).
+          RCView::td(array('class'=>'td2'), "<label for='logic-$id'><b>$label:</b></label>").
+          RCView::td(array('class'=>'td3'),
+            RCView::span(array(),
+              RCView::radio(array('name'=>"include_record-$id",'value'=>'1',$enabledChecked=>$enabledChecked)).
+              RCView::span(array('class'=>'radio-option'),'Enabled') . RCView::SP . RCView::SP .
+              RCView::radio(array('name'=>"include_record-$id",'value'=>'0',$disabledChecked=>$disabledChecked)).
+              RCView::span(array('class'=>'radio-option'),'Disabled')
+            )
+          )
+        );
+        return $row;
+      }
+
+    // Renders a radio that allows selection of eval once per record(1) or record/event (default/0) - only displayed for longitudinal projects
+    public function renderScopeRow($id, $label, $value) {
+        //error_log('ID:'.$id.' and VALUE:'.$value);
+        $perRecordChecked = ($value == 1 ? 'checked' : '');
+        $perRecordEventChecked = ($value == 1 ? '' : 'checked');
+        $row = RCView::tr(array(),
+            RCView::td(array('class'=>'td1'), self::insertHelp('scope')).
+            RCView::td(array('class'=>'td2'), "<label for='scope-$id'><b>$label:</b></label>").
+            RCView::td(array('class'=>'td3'),
+                RCView::span(array(),
+                    RCView::radio(array('name'=>"scope-$id",'value'=>'1',$perRecordChecked=>$perRecordChecked)).
+                    RCView::span(array('class'=>'radio-option'),'Once per Record') . RCView::SP . RCView::SP .
+                    RCView::radio(array('name'=>"scope-$id",'value'=>'0',$perRecordEventChecked=>$perRecordEventChecked)).
+                    RCView::span(array('class'=>'radio-option'),'Once per Record/Event')
+                )
+            )
+        );
+        return $row;
+    }
+
+    // Renders a test row with dropdowns for the various events/records in the project
+    public function renderTestRow($id, $label, $selectedRecord, $selectedEvent) {
+        // Make a dropdown that contains all record_ids.
+        $data = REDCap::getData('array', NULL, REDCap::getRecordIdField());
+//error_log("data: ".print_r($data,true));
+        foreach ($data as $record_id => $arr) $record_id_options[$record_id] = $record_id;
+
+        // Get all Events
+        $events = REDCap::getEventNames(TRUE,FALSE);
+        $row = RCView::tr(array(),
+            RCView::td(array('class'=>'td1'), self::insertHelp('test')).
+            RCView::td(array('class'=>'td2'), "<label for='test-$id'><b>$label:</b></label>").
+            RCView::td(array('class'=>'td3'),
+                RCView::span(array(), "Test logic using ".REDCap::getRecordIdField().":".
+                    RCView::select(array('id'=>"test_record-$id", 'name'=>"test_record-$id", 'class'=>"tbi x-form-text x-form-field", 'style'=>'height:20px;border:0px;', 'onchange'=>"testLogic('$id');"), $record_id_options, $selectedRecord)
+                ).
+                RCView::span(array('style'=>'display:'. (REDCap::isLongitudinal() ? 'inline;':'none;')), " of event ".
+                    RCView::select(array('id'=>"test_event-$id", 'name'=>"test_event-$id", 'class'=>"tbi x-form-text x-form-field", 'style'=>'height:20px;border:0px;', 'onchange'=>"testLogic('$id');"), $events, $selectedEvent)
+                ).
+                RCView::span(array(),
+                    RCView::button(array('class'=>'jqbuttonmed ui-button ui-widget ui-state-default ui-corner-all ui-button-text-only','onclick'=>'testLogic("'.$id.'");', 'style'=>'margin:0px 10px;'), 'Test').
+                    RCView::span(array('id'=>'result-'.$id),'')
+                )
+            )
+        );
+        return $row;
+    }
+
+    public function insertHelp($e) {
+        return "<span><a href='javascript:;' id='".$e."_info_trigger' info='".$e."_info' class='info' title='Click for help'><img class='imgfix' style='height: 16px; width: 16px;' src='".APP_PATH_IMAGES."help.png'></a></span>";
+    }
+
+    public function renderHelpDivs() {
+        $help = RCView::div(array('id'=>'to_info','style'=>'display:none;'),
+                RCView::p(array(),'The following are valid email formats.  Piping is also supported.'.
+                    RCView::ul(array('style'=>'margin-left:15px;'),
+                        RCView::li(array(),'&raquo; user@example.com').
+                        RCView::li(array(),'&raquo; user@example.com, anotheruser@example.com')
+                    )
+                )  
+            ).RCView::div(array('id'=>'from_info','style'=>'display:none;'),
+                RCView::p(array(),'Please note that some spam filters my classify this email as spam - you should test prior to going into production.'.
+                    RCView::ul(array('style'=>'margin-left:15px;'),
+                        RCView::li(array(),'A valid format is: user@example.com')
+                    )
+                )
+            ).RCView::div(array('id'=>'subject_info','style'=>'display:none;'),
+                RCView::p(array(),'<b>Send Secure</b> is an email service designed to protect Partners Confidential Data contained in messages sent from a Partners email address to a non-Partners email address/domain. If you must use email to communicate Partners Confidential Data to a non-Partners address, you must include <b>SEND SECURE</b> in the subject.')
+            ).RCView::div(array('id'=>'enabled_info','style'=>'display:none;'),
+                RCView::p(array(),'Instead of deleting/removing triggers, you can set them to <B>Disabled</B>. If you want to re-activate the trigger, simply set it back to <B>Enabled</B>')
+            ).RCView::div(array('id'=>'bcc_info','style'=>'display:none;'),
+                RCView::p(array(),'Specify a Blind Carbon Copy e-mail'.
+		    RCView::ul(array('style'=>'margin-left:15px;'),
+                        RCView::li(array(),'A valid format is: user@example.com')
+                    )
+		)
+            ).RCView::div(array('id'=>'body_info','style'=>'display:none;'),
+                RCView::p(array(),'This message will be included in the alert.  Piping is supported.')
+            ).
+            RCView::div(array('id'=>'title_info','style'=>'display:none;'),
+                RCView::p(array(),'An alert will only be fired once per title per record or record/event depending on the setting of the scope.  This means that if you rename a trigger it may re-fire next time you save a previously true record.  The title of the alert will also be included in the notification email.')
+            ).
+            RCView::div(array('id'=>'logic_info','style'=>'display:none;'),
+                RCView::p(array(),'This is an expression that will be evaluated to determine if the saved record should trigger an alert.  You should use the same format you use for branching logic.')
+            ).
+            RCView::div(array('id'=>'scope_info','style'=>'display:none;'),
+                RCView::p(array(),'By default, each trigger will fire once per title/record/event.  So, if you had a repeating survey with a sensitive question in many events, it would re-fire for each event.  However, if you have an alert which should only fire once per record (say, in demographics) - then select once per record.')
+            ).
+            RCView::div(array('id'=>'test_info','style'=>'display:none;'),
+                RCView::p(array(),'You can test your logical expression by selecting a record (and event) to evaluate the expression against.  This is useful if you have an existing record that would be a match for your condition.')
+            ).RCView::div(array('id'=>'post_script_det_url_info','style'=>'display:none;'),
+                RCView::p(array(),'By inserting a pipe-separated (e.g. | char) list of valid URLs into this field you can trigger additional DETs <b>AFTER</b> this one is complete.  This is useful for chaining DETs together.')
+            ).RCView::div(array('id'=>'pre_script_det_url_info','style'=>'display:none;'),
+                RCView::p(array(),'By inserting a pipe-separated (e.g. | char) list of valid URLs into this field you can trigger additional DETs to run <b>BEFORE</b> this notification trigger.  This might be useful for running an auto-scoring algorithm, for example.')
+            );
+        echo $help;
+    }
+
 } // End of Class
 
 
-// Displays a dialog that automatically fades in/out
+
 function renderTemporaryMessage($msg, $title='') {
-	$id = uniqid();
-	$html = RCView::div(array('id'=>$id,'class'=>'green','style'=>'margin-top:20px;padding:10px 10px 15px;'),
-		RCView::div(array('style'=>'text-align:center;font-size:20px;font-weight:bold;padding-bottom:5px;'), $title).
-		RCView::div(array(), $msg)
-	);
-	$js = "<script type='text/javascript'>
+    $id = uniqid();
+    $html = RCView::div(array('id'=>$id,'class'=>'green','style'=>'margin-top:20px;padding:10px 10px 15px;'),
+        RCView::div(array('style'=>'text-align:center;font-size:20px;font-weight:bold;padding-bottom:5px;'), $title).
+        RCView::div(array(), $msg)
+    );
+    $js = "<script type='text/javascript'>
 	$(function(){
 		t".$id." = setTimeout(function(){
 			$('#".$id."').hide('blind',1500);
-		},2000);
+		},10000);
 		$('#".$id."').bind( 'click', function() { 
 			$(this).hide('blind',1000);
 			window.clearTimeout(t".$id.");
 		});
 	});
 	</script>";
-	echo $html . $js;
+    echo $html . $js;
 }
+
 
 // Get variable or empty string from _REQUEST
 function voefr($var) {
-	$result = isset($_REQUEST[$var]) ? $_REQUEST[$var] : "";
-	return $result;
+    $result = isset($_REQUEST[$var]) ? $_REQUEST[$var] : "";
+    return $result;
 }
 
 function insertImage($i) {
-	return "<img class='imgfix' style='height: 16px; width: 16px; vertical-align: middle;' src='".APP_PATH_IMAGES.$i.".png'>";
+    return "<img class='imgfix' style='height: 16px; width: 16px; vertical-align: middle;' src='".APP_PATH_IMAGES.$i.".png'>";
 }
 
 #display an error from scratch
 function showError($msg) {
-	$HtmlPage = new HtmlPage();
-	$HtmlPage->PrintHeaderExt();
-	echo "<div class='red'>$msg</div>";
+    $HtmlPage = new HtmlPage();
+    $HtmlPage->PrintHeaderExt();
+    echo "<div class='red'>$msg</div>";
 }
 
 function injectPluginTabs($pid, $plugin_path, $plugin_name) {
-	$msg = '<script>
-		jQuery("#sub-nav ul").append(\'<li class="active"><a style="font-size:13px;color:#393733;padding:4px 9px 7px 10px;" href="'.$plugin_path.'"><img src="' . APP_PATH_IMAGES . 'email.png" class="imgfix" style="height:16px;width:16px;"> ' . $plugin_name . '</a></li>\');
+    $msg = '<script>
+		jQuery("#sub-nav ul li:last-child").before(\'<li class="active"><a style="font-size:13px;color:#393733;padding:4px 9px 7px 10px;" href="'.$plugin_path.'"><img src="' . APP_PATH_IMAGES . 'email.png" class="imgfix" style="height:16px;width:16px;"> ' . $plugin_name . '</a></li>\');
 		</script>';
-	echo $msg;
+    echo $msg;
 }
 
 function logIt($msg, $level = "INFO") {
-	global $log_prefix;
-	file_put_contents( $log_prefix . "-" . date( 'Y-m' ) . ".log",	date( 'Y-m-d H:i:s' ) . "\t" . $level . "\t PID: " . PROJECT_ID . "\t" . $msg . "\n", FILE_APPEND );
+    global $log_file, $project_id;
+    if ( !empty($log_file) ) file_put_contents( $log_file,
+        date( 'Y-m-d H:i:s' ) . "\t" . $project_id . "\t" . $level . "\t" . $msg . "\n",
+        FILE_APPEND );
+}
+
+// Function for decrypting (from version 643)
+function decrypt_643($encrypted_data, $custom_salt=null)
+{
+    if (!mcrypt_loaded()) return false;
+    // $salt from db connection file
+    global $salt;
+    // If $custom_salt is not provided, then use the installation-specific $salt value
+    $this_salt = ($custom_salt === null) ? $salt : $custom_salt;
+    // If salt is longer than 32 characters, then truncate it to prevent issues
+    if (strlen($this_salt) > 32) $this_salt = substr($this_salt, 0, 32);
+    // Define an encryption/decryption variable beforehand
+    defined("MCRYPT_IV") or define("MCRYPT_IV", mcrypt_create_iv(mcrypt_get_iv_size(MCRYPT_RIJNDAEL_256, MCRYPT_MODE_ECB), MCRYPT_RAND));
+    // Decrypt and return
+    return rtrim(mcrypt_decrypt(MCRYPT_RIJNDAEL_256, $this_salt, base64_decode($encrypted_data), MCRYPT_MODE_ECB, MCRYPT_IV),"\0");
+}
+
+function decrypt_me($encrypted_data) {
+    // Try decrypting using the current format:
+    $t1 = decrypt($encrypted_data);
+    $t1_json = json_decode($t1,true);
+    if (json_last_error() == JSON_ERROR_NONE) return $t1;
+    $t2 = decrypt_643($encrypted_data);
+    $t2_json = json_decode($t2,true);
+    if (json_last_error() == JSON_ERROR_NONE) return $t2;
+    print "ERROR DECODING";
+    return false;
+}
+
+function viewLog($file) {
+    // Render the page
+    $page = new HtmlPage();
+    $page->addExternalJS("https://cdnjs.cloudflare.com/ajax/libs/ace/1.2.2/ace.js");
+    //$page->addExternalJS("https://cdnjs.cloudflare.com/ajax/libs/ace/1.2.2/ext-searchbox.js");
+    //$page->addExternalJS("https://rawgithub.com/ajaxorg/ace-builds/master/src/ext-language_tools.js");
+    //$page->addExternalJs("https://code.jquery.com/jquery-2.0.3.min.js");
+    $page->addExternalJS(APP_PATH_JS . "base.js");
+    $page->addStylesheet("jquery-ui.min.css", 'screen,print');
+    //$page->addStylesheet("style.css", 'screen,print');
+    //$page->addStylesheet("home.css", 'screen,print');
+
+    $page->setPageTitle("Log View");
+    $page->PrintHeader();
+
+//	require_once APP_PATH_DOCROOT . 'ProjectGeneral/header.php';
+    print RCView::div(
+        array('class'=>'chklisthdr', 'style'=>'color:rgb(128,0,0);margin-top:10px;'),
+        "Custom Log File: " . $file
+    );
+
+    ?>
+    <div id="editor" style="height: 500px; width: 100%; display:none;"><?php
+        // Easy method
+        //readfile_chunked($file);
+
+        // harder method
+        $lines = file($file);
+        $re = "/^.+\\t(\\d+)\\t/";
+        global $project_id;
+        foreach ($lines as $k => $line) {
+            if (preg_match($re,$line, $matches)) {
+                if ($matches[1] != $project_id) {
+                    unset($lines[$k]);
+                }
+            }
+        }
+        echo implode("",$lines);
+        ?></div>
+    <div id="commandline" style="margin-top:10px;">This is the global <?php echo AutoNotify::PluginName ?> log.  Refresh for an update.</div>
+    <script>
+        $(document).ready(function(){
+            //var langTools = ace.require("ace/ext/language_tools");
+            var editor = ace.edit("editor");
+            editor.$blockScrolling = Infinity;
+            editor.resize(true);
+            editor.setReadOnly(true);
+            editor.setOptions({
+                autoScrollEditorIntoView: true,
+                showPrintMargin: false,
+                fontSize: "8pt"
+            });
+            $('#editor').css({'border':'1px solid'}).fadeIn('slow');
+            var row = editor.session.getLength() - 1
+            editor.gotoLine(row, 0);
+            editor.resize(true); // There is a bug in current version requiring this...
+            editor.scrollToLine(row);
+        });
+    </script>
+    <?php
 }
 
 
+
+
 ?>
+

@@ -1,7 +1,21 @@
 <?php
+
 ##
-# © 2016 Partners HealthCare System, Inc. All Rights Reserved. 
+# Â© 2016 Partners HealthCare System, Inc. All Rights Reserved. 
 ##
+/**
+	
+	Supporting functions for enhanced autonotification plugin.
+ 
+  Originally based on Autonotify plugin by Andy Martin.
+  As of June 2016, it support multiple notification emails in addition to multiple 
+  triggers.  The new version offers the ability to upgrade existing autonitfy 
+  configurations on first use.
+	
+	It must be used in conjunction with a data entry trigger to function in real-time.
+	The settings for each project are stored as an encoded variable (an) in the query 
+  string of the DET.
+**/
 
 	/**
 	* This file contains some functions that were plucked out of the REDCap code from version 5.x.x
